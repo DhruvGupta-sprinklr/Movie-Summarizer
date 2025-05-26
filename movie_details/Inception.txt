@@ -1,11 +1,13 @@
 Movie Title: Inception (2010)
 --------------------------------------
-
 IMDb Rating:
   8.8
 
 Main Cast:
   Leonardo DiCaprio, Joseph Gordon-Levitt, Elliot Page
+
+Genre(s):
+  Action, Adventure, Sci-Fi
 
 Movie Theme:
   The perilous pursuit of redemption through manipulating dreams.

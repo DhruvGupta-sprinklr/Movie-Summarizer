@@ -10,6 +10,7 @@ import {
 } from '@langchain/core/prompts';
 import { LLMChain } from 'langchain/chains';
 import { Tool } from '@langchain/core/tools';
+import { RunnableSequence, RunnableLambda, RunnablePassthrough } from "@langchain/core/runnables";
 
 const OMDB_API_KEY = process.env.OMDB_API_KEY;
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
@@ -28,7 +29,7 @@ if (!GOOGLE_API_KEY) {
 const llm = new ChatGoogleGenerativeAI({
     apiKey: GOOGLE_API_KEY,
     model: 'gemini-1.5-flash-latest',
-    temperature: 0.2, 
+    temperature: 0.1,
 });
 
 function sanitizeFilename(name) {
@@ -36,7 +37,6 @@ function sanitizeFilename(name) {
     return name.replace(/[^a-z0-9_\-\s\.]/gi, '').replace(/\s+/g, '_').toLowerCase();
 }
 
-// --- AGENT 1 (Chain): Title Refinement ---
 const titleRefinementPrompt = ChatPromptTemplate.fromMessages([
     SystemMessagePromptTemplate.fromTemplate(
         "You are an expert movie title refiner. Given a user's raw movie title, your goal is to return the most likely official movie title. " +
@@ -44,8 +44,6 @@ const titleRefinementPrompt = ChatPromptTemplate.fromMessages([
         "For example:\n" +
         "- 'uri bollywood' should become 'Uri: The Surgical Strike'\n" +
         "- 'inceptio' should become 'Inception'\n" +
-        "- 'the surgical strike uri' should become 'Uri: The Surgical Strike'\n" +
-        "- 'terminator salvation' should become 'Terminator Salvation'\n" +
         "If the input is already a clear and official-looking title, return it as is. " +
         "If you are highly uncertain or the input is too vague (e.g., just 'action movie'), return the original input and add a note like 'UNCERTAIN: Could not reliably refine title.' " +
         "Only return the refined title (or original with note if uncertain)."
@@ -59,15 +57,20 @@ const titleRefinementChain = new LLMChain({
     outputKey: "refined_title_text",
 });
 
-// --- AGENT 2 (Tool): Movie Data Fetcher ---
 class OMDBMovieInfoTool extends Tool {
     name = "OMDBMovieInfoFetcher";
-    description = "Fetches detailed movie information (IMDb rating, cast, genre, plot) from the OMDB API given a refined movie title. Input should be the refined movie title string.";
+    description = "Fetches detailed movie information from OMDB. Input: refined movie title. Output: JSON string of movie data or error string.";
 
     async _call(refinedMovieTitle) {
-        console.log(`  OMDBTool: Searching for refined title "${refinedMovieTitle}"...`);
+        console.log(`  [OMDBTool]: Searching for refined title "${refinedMovieTitle}"...`);
         if (!refinedMovieTitle || refinedMovieTitle.startsWith("UNCERTAIN:")) {
-            throw new Error(`Cannot search OMDB with uncertain title: ${refinedMovieTitle}`);
+            const message = `OMDBTool: Cannot reliably search OMDB with title: ${refinedMovieTitle}`;
+            console.warn(`  ${message}`);
+            return JSON.stringify({
+                error: message,
+                title: refinedMovieTitle.replace("UNCERTAIN: ", ""),
+                plotSummary: "N/A", genre:"N/A", year:"N/A", imdbRating:"N/A", mainCast:"N/A"
+            });
         }
         try {
             const apiUrl = `${OMDB_BASE_URL}?apikey=${OMDB_API_KEY}&t=${encodeURIComponent(refinedMovieTitle)}&plot=full`;
@@ -75,38 +78,41 @@ class OMDBMovieInfoTool extends Tool {
             const data = response.data;
 
             if (data.Response === 'False') {
-                throw new Error(`OMDB API Error for title "${refinedMovieTitle}": ${data.Error}`);
+                const errorMsg = `OMDB API Error for title "${refinedMovieTitle}": ${data.Error}`;
+                 console.warn(`  ${errorMsg}`);
+                return JSON.stringify({
+                    error: errorMsg,
+                    title: refinedMovieTitle,
+                    plotSummary: "N/A", genre:"N/A", year:"N/A", imdbRating:"N/A", mainCast:"N/A"
+                });
             }
-
-            const imdbRating = data.imdbRating || 'N/A';
-            const actors = data.Actors ? data.Actors.split(',').map(actor => actor.trim()) : [];
-            const mainCast = actors.slice(0, 5).join(', ') || 'N/A';
-            const genre = data.Genre || 'N/A';
-            const plotSummary = data.Plot || 'N/A';
-            const year = data.Year || 'N/A';
-            const title = data.Title || refinedMovieTitle; 
-
-            return JSON.stringify({ 
-                title,
-                year,
-                imdbRating,
-                mainCast,
-                genre,
-                plotSummary
-            });
+            const result = {
+                title: data.Title || refinedMovieTitle,
+                year: data.Year || 'N/A',
+                imdbRating: data.imdbRating || 'N/A',
+                mainCast: (data.Actors ? data.Actors.split(',').map(actor => actor.trim()).slice(0,5).join(', ') : 'N/A') || 'N/A',
+                genre: data.Genre || 'N/A',
+                plotSummary: data.Plot || 'N/A'
+            };
+            console.log(`  [OMDBTool]: Successfully fetched data for: "${result.title} (${result.year})"`);
+            return JSON.stringify(result);
         } catch (error) {
-            console.error(`  Error in OMDBMovieInfoTool with title "${refinedMovieTitle}":`, error.message);
-            throw error; 
+            console.error(`  [OMDBTool]: Error with title "${refinedMovieTitle}":`, error.message);
+            return JSON.stringify({
+                error: `OMDBTool internal error for title "${refinedMovieTitle}": ${error.message}`,
+                title: refinedMovieTitle,
+                plotSummary: "N/A", genre:"N/A", year:"N/A", imdbRating:"N/A", mainCast:"N/A"
+            });
         }
     }
 }
+const omdbTool = new OMDBMovieInfoTool();
 
-// --- AGENT 3 (Chain): Content Refinement (Theme) ---
 const themeGenerationPrompt = ChatPromptTemplate.fromMessages([
     SystemMessagePromptTemplate.fromTemplate(
         "You are an expert movie analyst. Your task is to derive a concise 'Movie Theme' from the provided movie title, genre, and plot summary. " +
-        "The theme should be a short, descriptive phrase (10-15 words max) capturing the central idea, tone, or dominant message, going beyond just listing genres. " +
-        "For example, if genre is Action/Sci-Fi and plot involves dystopian future, a good theme could be 'Rebellion against oppressive technology in a dystopian future.' or 'The human spirit's fight for freedom against overwhelming odds.'"
+        "The theme should be a short, descriptive phrase (10-15 words max) capturing the central idea, tone, or dominant message. " +
+        "If the plot is N/A or too brief, state 'Theme could not be determined due to lack of plot details.'"
     ),
     HumanMessagePromptTemplate.fromTemplate(
         "Movie Title: {title}\nGenre(s): {genre}\nPlot Summary: {plot}\n\nDerived Movie Theme:"
@@ -119,124 +125,164 @@ const themeGenerationChain = new LLMChain({
     outputKey: "movie_theme_text",
 });
 
-// --- AGENT 4 (Tool): File Writer ---
 class FileWriterTool extends Tool {
   name = "MovieInfoFileWriter";
-  description = "Writes movie info (title, year, rating, cast, theme, plot) to a text file.";
+  description = "Writes movie info to a text file. Input: JSON string of movie data including theme.";
 
-  async _call(movieData) {
-    
-    let dataObj = movieData;
-    if (typeof movieData === "string") {
-      try {
-        dataObj = JSON.parse(movieData);
-      } catch (e) {
-        throw new Error(`MovieInfoFileWriter: Failed to parse JSON input: ${e.message}`);
-      }
+  async _call(movieDataJsonString) {
+    console.log(`  [FileWriterTool]: Preparing to write file...`);
+    let dataObj;
+    try {
+        dataObj = JSON.parse(movieDataJsonString);
+    } catch (e) {
+        const errorMsg = `MovieInfoFileWriter: Failed to parse JSON input: ${e.message}. Input: ${movieDataJsonString}`;
+        console.error(`  ${errorMsg}`);
+        return errorMsg;
     }
-    
+
     if (!dataObj.title) {
-      throw new Error("MovieInfoFileWriter: Missing required field `title` on dataObj");
+      const errorMsg = `MovieInfoFileWriter: Missing 'title' in data: ${JSON.stringify(dataObj)}`;
+      console.error(`  ${errorMsg}`);
+      return errorMsg;
+    }
+    if (dataObj.error && !dataObj.plotSummary) {
+        const message = `FileWriterTool: Skipped writing for "${dataObj.title}" due to previous errors: ${dataObj.error}`;
+        console.warn(`  ${message}`);
+        return message;
     }
 
-    
-    console.log(`  FileWriterTool: Preparing to write file for "${dataObj.title}"...`);
     const fileContent = `Movie Title: ${dataObj.title} (${dataObj.year || 'N/A'})
 --------------------------------------
-
 IMDb Rating:
   ${dataObj.imdbRating || 'N/A'}
 
 Main Cast:
   ${dataObj.mainCast || 'N/A'}
 
+Genre(s):
+  ${dataObj.genre || 'N/A'}
+
 Movie Theme:
-  ${dataObj.movieTheme || 'N/A'}
+  ${dataObj.movieTheme || 'Theme could not be determined.'}
 
 Plot Summary:
   ${dataObj.plotSummary || 'N/A'}
 `;
-    await fs.mkdir(OUTPUT_DIR, { recursive: true });
-    const sanitizedMovieName = sanitizeFilename(dataObj.title);
-    const filePath = path.join(OUTPUT_DIR, `${sanitizedMovieName}.txt`);
-    await fs.writeFile(filePath, fileContent);
-
-    const successMessage = `Successfully wrote movie details to: ${filePath}`;
-    console.log(`  ${successMessage}`);
-    return successMessage;
+    try {
+        await fs.mkdir(OUTPUT_DIR, { recursive: true });
+        const sanitizedMovieName = sanitizeFilename(dataObj.title);
+        const filePath = path.join(OUTPUT_DIR, `${sanitizedMovieName}.txt`);
+        await fs.writeFile(filePath, fileContent);
+        const successMessage = `Successfully wrote movie details for "${dataObj.title}" to: ${filePath}`;
+        console.log(`  [FileWriterTool]: ${successMessage}`);
+        return successMessage;
+    } catch (error) {
+        const errorMsg = `MovieInfoFileWriter: Error writing file for "${dataObj.title}": ${error.message}`;
+        console.error(`  [FileWriterTool]: ${errorMsg}`);
+        return errorMsg;
+    }
   }
 }
+const fileWriterTool = new FileWriterTool();
 
-
-
-// --- Main Orchestration Logic ---
-async function processMoviePipeline(rawUserMovieTitle) {
+async function processMovieWithLCELSequence(rawUserMovieTitle) {
     if (!rawUserMovieTitle) {
         console.error('Error: Please provide a movie name.');
         console.log('Usage: node your_script_name.js "Your Movie Title"');
         return;
     }
-    console.log(`\n Starting movie processing pipeline for raw title: "${rawUserMovieTitle}"`);
+    console.log(`\n⚙️ Starting LCEL Sequential processing for: "${rawUserMovieTitle}"`);
 
-    let refinedTitle;
-    let movieDataFromOMDB;
-    let generatedTheme;
-
-    try {
-        // === Step 1: Refine Title ===
-        console.log("\n[AGENT 1/CHAIN: Title Refinement]");
-        const titleResult = await titleRefinementChain.call({ raw_title: rawUserMovieTitle });
-        refinedTitle = titleResult.refined_title_text.trim(); 
-        console.log(`  Input Raw Title: "${rawUserMovieTitle}"`);
+    const titleRefinerRunnable = RunnableLambda.from(async (inputObject) => {
+        console.log("\n[LCEL Step 1: Title Refinement]");
+        const result = await titleRefinementChain.invoke({ raw_title: inputObject.raw_title });
+        const refinedTitle = result.refined_title_text.trim();
+        console.log(`  Input Raw Title: "${inputObject.raw_title}"`);
         console.log(`  LLM Refined Title: "${refinedTitle}"`);
+        return { ...inputObject, refinedTitle: refinedTitle };
+    }).withConfig({ runName: "TitleRefinementStep" });
 
-        if (refinedTitle.startsWith("UNCERTAIN:") || !refinedTitle) {
-            console.warn(`   Title refinement was uncertain or failed. Original: "${rawUserMovieTitle}", Refined: "${refinedTitle}"`);
-        
+    const omdbFetcherRunnable = RunnableLambda.from(async (inputObject) => {
+        console.log("\n[LCEL Step 2: Fetching Movie Data from OMDB]");
+        const omdbDataString = await omdbTool._call(inputObject.refinedTitle);
+        let movieDataFromOMDB;
+        try {
+            movieDataFromOMDB = JSON.parse(omdbDataString);
+        } catch (e) {
+            console.error("  OMDB Data JSON parse error:", e, "Received:", omdbDataString);
+            movieDataFromOMDB = {
+                error: `Failed to parse OMDB response: ${omdbDataString}`,
+                title: inputObject.refinedTitle,
+                plotSummary: "N/A", genre:"N/A", year:"N/A", imdbRating:"N/A", mainCast:"N/A"
+            };
+        }
+        if (movieDataFromOMDB.error) {
+            console.warn(`  OMDB Fetch problem for "${inputObject.refinedTitle}": ${movieDataFromOMDB.error}`);
+        } else {
+            console.log(`  Successfully fetched/parsed data for: "${movieDataFromOMDB.title} (${movieDataFromOMDB.year})"`);
+        }
+        return { ...inputObject, movieDataFromOMDB };
+    }).withConfig({ runName: "OMDBFetcherStep" });
+
+    const themeGeneratorRunnable = RunnableLambda.from(async (inputObject) => {
+        console.log("\n[LCEL Step 3: Generating Movie Theme]");
+        const { movieDataFromOMDB } = inputObject;
+
+        if (movieDataFromOMDB.error || !movieDataFromOMDB.plotSummary || movieDataFromOMDB.plotSummary === "N/A") {
+            console.warn(`  Skipping theme generation for "${movieDataFromOMDB.title}" due to missing/error in movie data.`);
+            return { ...inputObject, generatedTheme: "Theme could not be determined due to prior issues." };
         }
 
-        // === Step 2: Fetch Movie Data ===
-        console.log("\n[AGENT 2/TOOL: Fetching Movie Data from OMDB]");
-        const omdbTool = new OMDBMovieInfoTool();
-        const omdbDataString = await omdbTool.call(refinedTitle); // Pass the refined title
-        movieDataFromOMDB = JSON.parse(omdbDataString); // Parse the JSON string from the tool
-        console.log(`  Successfully fetched data for: "${movieDataFromOMDB.title} (${movieDataFromOMDB.year})"`);
-        console.log(`  IMDb Rating: ${movieDataFromOMDB.imdbRating}`);
-
-        // === Step 3: Generate Theme ===
-        console.log("\n[AGENT 3/CHAIN: Generating Movie Theme]");
-        const themeResult = await themeGenerationChain.call({
+        const themeResult = await themeGenerationChain.invoke({
             title: movieDataFromOMDB.title,
             genre: movieDataFromOMDB.genre,
             plot: movieDataFromOMDB.plotSummary,
         });
-        generatedTheme = themeResult.movie_theme_text.trim();
-        console.log(`  Generated Theme: "${generatedTheme}"`);
+        const theme = themeResult.movie_theme_text.trim();
+        console.log(`  Generated Theme for "${movieDataFromOMDB.title}": "${theme}"`);
+        return { ...inputObject, generatedTheme: theme };
+    }).withConfig({ runName: "ThemeGenerationStep" });
 
-        // Combine all data for the file writer
-        const finalMovieData = {
-            ...movieDataFromOMDB,
-            movieTheme: generatedTheme,
+    const fileWriterRunnable = RunnableLambda.from(async (inputObject) => {
+        console.log("\n[LCEL Step 4: Writing Details to File]");
+        const { movieDataFromOMDB, generatedTheme } = inputObject;
+
+        const finalMovieDataForFile = {
+            title: movieDataFromOMDB.title || inputObject.refinedTitle,
+            year: movieDataFromOMDB.year || 'N/A',
+            imdbRating: movieDataFromOMDB.imdbRating || 'N/A',
+            mainCast: movieDataFromOMDB.mainCast || 'N/A',
+            genre: movieDataFromOMDB.genre || 'N/A',
+            plotSummary: movieDataFromOMDB.plotSummary || 'N/A',
+            movieTheme: generatedTheme || 'Theme could not be determined.',
+            omdbError: movieDataFromOMDB.error || null
         };
+         if (finalMovieDataForFile.omdbError && !finalMovieDataForFile.plotSummary === 'N/A') {
+            console.warn(`  File for "${finalMovieDataForFile.title}" will reflect data fetching issues.`);
+        }
 
-        // === Step 4: Write to File ===
-        console.log("\n[AGENT 4/TOOL: Writing Details to File]");
-        const fileWriterTool = new FileWriterTool();
-        const fileWriteResult = await fileWriterTool._call(finalMovieData); 
+        const fileWriteResult = await fileWriterTool._call(JSON.stringify(finalMovieDataForFile));
         console.log(`  File Writer Status: ${fileWriteResult}`);
+        return { finalMessage: fileWriteResult, writtenData: finalMovieDataForFile };
+    }).withConfig({ runName: "FileWriterStep" });
 
-        console.log("\n Pipeline completed successfully!");
+    const fullSequence = RunnableSequence.from([
+        titleRefinerRunnable,
+        omdbFetcherRunnable,
+        themeGeneratorRunnable,
+        fileWriterRunnable,
+    ]);
 
+    try {
+        const result = await fullSequence.invoke({ raw_title: rawUserMovieTitle });
+        console.log("\n LCEL Sequence completed.");
+        console.log("Final Output from Sequence:", result.finalMessage);
     } catch (error) {
-        console.error("\n Error during movie processing pipeline:");
-        console.error(`  Message: ${error.message}`);
-        if (refinedTitle) console.error(`  Refined Title at time of error: "${refinedTitle}"`);
-        if (movieDataFromOMDB && movieDataFromOMDB.title) console.error(`  Movie being processed: "${movieDataFromOMDB.title}"`);
-        
+        console.error("\n Critical error during LCEL sequence execution:", error);
     }
 }
 
 (async () => {
-    const movieNameInput = process.argv.slice(2).join(" ");
-    await processMoviePipeline(movieNameInput);
+    const movieNameInput = process.argv.slice(2).join(" ") || "inceptio";
+    await processMovieWithLCELSequence(movieNameInput);
 })();
