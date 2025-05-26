@@ -11,14 +11,16 @@ This Node.js script fetches movie details (IMDb rating, cast, plot) using the OM
 ## Setup
 
 1.  **Install Dependencies:**
+    ```bash
     npm install dotenv axios @langchain/google-genai @langchain/core langchain
+    ```
 
 2.  **Create `.env` file:**
     In the project root, create `.env` with your API keys:
-
+    ```env
     OMDB_API_KEY="YOUR_OMDB_API_KEY"
     GOOGLE_API_KEY="YOUR_GOOGLE_API_KEY"
-    
+    ```
 
 ## How to Run
 
