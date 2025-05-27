@@ -1,7 +1,6 @@
 import 'dotenv/config';
 import fs from 'fs/promises';
 import path from 'path';
-import axios from 'axios';
 import { ChatGoogleGenerativeAI } from '@langchain/google-genai';
 import {
     ChatPromptTemplate,
@@ -9,8 +8,8 @@ import {
     SystemMessagePromptTemplate,
 } from '@langchain/core/prompts';
 import { LLMChain } from 'langchain/chains';
-import { Tool } from '@langchain/core/tools';
-import { RunnableSequence, RunnableLambda, RunnablePassthrough } from "@langchain/core/runnables";
+import { RunnableSequence, RunnableLambda } from "@langchain/core/runnables";
+import { StringOutputParser } from "@langchain/core/output_parsers";
 
 const OMDB_API_KEY = process.env.OMDB_API_KEY;
 const GOOGLE_API_KEY = process.env.GOOGLE_API_KEY;
@@ -34,8 +33,28 @@ const llm = new ChatGoogleGenerativeAI({
 
 function sanitizeFilename(name) {
     if (!name || typeof name !== 'string') return 'untitled_movie';
-    return name.replace(/[^a-z0-9_\-\s\.]/gi, '').replace(/\s+/g, '_').toLowerCase();
+    return name
+        .toLowerCase()
+        .replace(/\s+/g, '_')
+        .replace(/[^a-z0-9_\-\.]/gi, '')
+        .replace(/\.+/g, '.')
+        .slice(0, 100);
 }
+
+function extractJsonFromString(str) {
+    if (typeof str !== 'string') {
+        console.warn("extractJsonFromString: input was not a string, returning as is.", str);
+        return str;
+    }
+   
+    const match = str.match(/```(?:json)?\s*([\s\S]*?)\s*```/);
+    if (match && match[1]) {
+        return match[1].trim(); 
+    }
+    return str.trim(); 
+}
+
+
 
 const titleRefinementPrompt = ChatPromptTemplate.fromMessages([
     SystemMessagePromptTemplate.fromTemplate(
@@ -57,56 +76,44 @@ const titleRefinementChain = new LLMChain({
     outputKey: "refined_title_text",
 });
 
-class OMDBMovieInfoTool extends Tool {
-    name = "OMDBMovieInfoFetcher";
-    description = "Fetches detailed movie information from OMDB. Input: refined movie title. Output: JSON string of movie data or error string.";
 
-    async _call(refinedMovieTitle) {
-        console.log(`  [OMDBTool]: Searching for refined title "${refinedMovieTitle}"...`);
-        if (!refinedMovieTitle || refinedMovieTitle.startsWith("UNCERTAIN:")) {
-            const message = `OMDBTool: Cannot reliably search OMDB with title: ${refinedMovieTitle}`;
-            console.warn(`  ${message}`);
-            return JSON.stringify({
-                error: message,
-                title: refinedMovieTitle.replace("UNCERTAIN: ", ""),
-                plotSummary: "N/A", genre:"N/A", year:"N/A", imdbRating:"N/A", mainCast:"N/A"
-            });
-        }
-        try {
-            const apiUrl = `${OMDB_BASE_URL}?apikey=${OMDB_API_KEY}&t=${encodeURIComponent(refinedMovieTitle)}&plot=full`;
-            const response = await axios.get(apiUrl);
-            const data = response.data;
+// --- 2. LLM-driven OMDB Data Simulation ---
+const omdbSimulationPrompt = ChatPromptTemplate.fromMessages([
+    SystemMessagePromptTemplate.fromTemplate(
+`You are an API simulator. Your task is to act as the OMDB API.
+Given a movie title, you must generate a JSON response that mimics a real OMDB API call.
+The OMDB API base URL is: ${OMDB_BASE_URL}
+The API key for context is: ${OMDB_API_KEY} (Do not include this in the response, just use for context)
+The conceptual query structure is: ?apikey=YOUR_KEY&t=MOVIE_TITLE&plot=full
 
-            if (data.Response === 'False') {
-                const errorMsg = `OMDB API Error for title "${refinedMovieTitle}": ${data.Error}`;
-                 console.warn(`  ${errorMsg}`);
-                return JSON.stringify({
-                    error: errorMsg,
-                    title: refinedMovieTitle,
-                    plotSummary: "N/A", genre:"N/A", year:"N/A", imdbRating:"N/A", mainCast:"N/A"
-                });
-            }
-            const result = {
-                title: data.Title || refinedMovieTitle,
-                year: data.Year || 'N/A',
-                imdbRating: data.imdbRating || 'N/A',
-                mainCast: (data.Actors ? data.Actors.split(',').map(actor => actor.trim()).slice(0,5).join(', ') : 'N/A') || 'N/A',
-                genre: data.Genre || 'N/A',
-                plotSummary: data.Plot || 'N/A'
-            };
-            console.log(`  [OMDBTool]: Successfully fetched data for: "${result.title} (${result.year})"`);
-            return JSON.stringify(result);
-        } catch (error) {
-            console.error(`  [OMDBTool]: Error with title "${refinedMovieTitle}":`, error.message);
-            return JSON.stringify({
-                error: `OMDBTool internal error for title "${refinedMovieTitle}": ${error.message}`,
-                title: refinedMovieTitle,
-                plotSummary: "N/A", genre:"N/A", year:"N/A", imdbRating:"N/A", mainCast:"N/A"
-            });
-        }
-    }
-}
-const omdbTool = new OMDBMovieInfoTool();
+If the movie is found based on your knowledge, the JSON response should include:
+- "Title": string (official movie title)
+- "Year": string (e.g., "2010")
+- "imdbRating": string (e.g., "8.8")
+- "Actors": string (comma-separated list of main actors, ideally 3-5 names)
+- "Genre": string (comma-separated list of genres)
+- "Plot": string (full plot summary)
+- "Response": "True"
+
+If the movie is NOT found in your knowledge or if you simulate an error:
+- "Response": "False"
+- "Error": string (e.g., "Movie not found!" or "Error simulating data.")
+
+IMPORTANT:
+1.  Only output the JSON string. Do not include any other text, explanations, or markdown formatting (like \`\`\`json ... \`\`\`).
+2.  Ensure the JSON is well-formed.
+3.  For "Actors" and "Genre", provide comma-separated strings.
+4.  If providing data, be as accurate as possible based on your training. If unsure, it's better to state "Movie not found!".
+`
+    ),
+    HumanMessagePromptTemplate.fromTemplate(
+        "Simulate OMDB API JSON response for the movie title: {refined_movie_title}"
+    ),
+]);
+
+const omdbSimulationLlmChain = omdbSimulationPrompt.pipe(llm).pipe(new StringOutputParser());
+
+
 
 const themeGenerationPrompt = ChatPromptTemplate.fromMessages([
     SystemMessagePromptTemplate.fromTemplate(
@@ -125,65 +132,56 @@ const themeGenerationChain = new LLMChain({
     outputKey: "movie_theme_text",
 });
 
-class FileWriterTool extends Tool {
-  name = "MovieInfoFileWriter";
-  description = "Writes movie info to a text file. Input: JSON string of movie data including theme.";
 
-  async _call(movieDataJsonString) {
-    console.log(`  [FileWriterTool]: Preparing to write file...`);
-    let dataObj;
-    try {
-        dataObj = JSON.parse(movieDataJsonString);
-    } catch (e) {
-        const errorMsg = `MovieInfoFileWriter: Failed to parse JSON input: ${e.message}. Input: ${movieDataJsonString}`;
-        console.error(`  ${errorMsg}`);
-        return errorMsg;
-    }
 
-    if (!dataObj.title) {
-      const errorMsg = `MovieInfoFileWriter: Missing 'title' in data: ${JSON.stringify(dataObj)}`;
-      console.error(`  ${errorMsg}`);
-      return errorMsg;
-    }
-    if (dataObj.error && !dataObj.plotSummary) {
-        const message = `FileWriterTool: Skipped writing for "${dataObj.title}" due to previous errors: ${dataObj.error}`;
-        console.warn(`  ${message}`);
-        return message;
-    }
+const fileContentGenerationPrompt = ChatPromptTemplate.fromMessages([
+    SystemMessagePromptTemplate.fromTemplate(
+`You are an expert file creation assistant.
+Your task is to take movie details and generate a JSON object containing:
+1.  A "filename": A sanitized filename string (lowercase, spaces to underscores, remove most non-alphanumeric characters except underscore/hyphen, max 60 chars, ending with .txt). Example: 'the_matrix_reloaded.txt'.
+2.  A "file_content": The fully formatted text content for the file.
 
-    const fileContent = `Movie Title: ${dataObj.title} (${dataObj.year || 'N/A'})
+The file content MUST follow this exact structure:
+Movie Title: {{title}} ({{year}})
 --------------------------------------
 IMDb Rating:
-  ${dataObj.imdbRating || 'N/A'}
+  {{imdbRating}}
 
 Main Cast:
-  ${dataObj.mainCast || 'N/A'}
+  {{mainCast}}
 
 Genre(s):
-  ${dataObj.genre || 'N/A'}
+  {{genre}}
 
 Movie Theme:
-  ${dataObj.movieTheme || 'Theme could not be determined.'}
+  {{movieTheme}}
 
 Plot Summary:
-  ${dataObj.plotSummary || 'N/A'}
-`;
-    try {
-        await fs.mkdir(OUTPUT_DIR, { recursive: true });
-        const sanitizedMovieName = sanitizeFilename(dataObj.title);
-        const filePath = path.join(OUTPUT_DIR, `${sanitizedMovieName}.txt`);
-        await fs.writeFile(filePath, fileContent);
-        const successMessage = `Successfully wrote movie details for "${dataObj.title}" to: ${filePath}`;
-        console.log(`  [FileWriterTool]: ${successMessage}`);
-        return successMessage;
-    } catch (error) {
-        const errorMsg = `MovieInfoFileWriter: Error writing file for "${dataObj.title}": ${error.message}`;
-        console.error(`  [FileWriterTool]: ${errorMsg}`);
-        return errorMsg;
-    }
-  }
-}
-const fileWriterTool = new FileWriterTool();
+  {{plotSummary}}
+
+Instructions:
+- Replace placeholders like {{title}} with the actual data.
+- If a piece of data is 'N/A', 'Not Available', or empty, represent it as 'N/A' in the output content.
+- The Movie Theme should be 'Theme could not be determined.' if the provided theme is empty, 'N/A', or indicates inability to determine.
+- You MUST output a single, well-formed JSON object with the two keys: "filename" and "file_content".
+- Do not include any other text, explanations, or markdown formatting (like \`\`\`json ... \`\`\`) around the JSON.
+- Ensure the file_content string correctly uses newline characters (\\n) for line breaks where appropriate in the template.
+`
+    ),
+    HumanMessagePromptTemplate.fromTemplate(
+`Generate the JSON for filename and file content using these details:
+Title: {title}
+Year: {year}
+IMDb Rating: {imdbRating}
+Main Cast: {mainCast}
+Genre: {genre}
+Movie Theme: {movieTheme}
+Plot Summary: {plotSummary}`
+    ),
+]);
+
+const fileContentGenerationLlmChain = fileContentGenerationPrompt.pipe(llm).pipe(new StringOutputParser());
+
 
 async function processMovieWithLCELSequence(rawUserMovieTitle) {
     if (!rawUserMovieTitle) {
@@ -196,93 +194,191 @@ async function processMovieWithLCELSequence(rawUserMovieTitle) {
     const titleRefinerRunnable = RunnableLambda.from(async (inputObject) => {
         console.log("\n[LCEL Step 1: Title Refinement]");
         const result = await titleRefinementChain.invoke({ raw_title: inputObject.raw_title });
-        const refinedTitle = result.refined_title_text.trim();
+        const refinedTitle = result.refined_title_text ? result.refined_title_text.trim() : inputObject.raw_title;
         console.log(`  Input Raw Title: "${inputObject.raw_title}"`);
         console.log(`  LLM Refined Title: "${refinedTitle}"`);
-        return { ...inputObject, refinedTitle: refinedTitle };
+        return { ...inputObject, refinedTitle };
     }).withConfig({ runName: "TitleRefinementStep" });
 
-    const omdbFetcherRunnable = RunnableLambda.from(async (inputObject) => {
-        console.log("\n[LCEL Step 2: Fetching Movie Data from OMDB]");
-        const omdbDataString = await omdbTool._call(inputObject.refinedTitle);
-        let movieDataFromOMDB;
-        try {
-            movieDataFromOMDB = JSON.parse(omdbDataString);
-        } catch (e) {
-            console.error("  OMDB Data JSON parse error:", e, "Received:", omdbDataString);
-            movieDataFromOMDB = {
-                error: `Failed to parse OMDB response: ${omdbDataString}`,
-                title: inputObject.refinedTitle,
-                plotSummary: "N/A", genre:"N/A", year:"N/A", imdbRating:"N/A", mainCast:"N/A"
+    const omdbSimulatorRunnable = RunnableLambda.from(async (inputObject) => {
+        console.log("\n[LCEL Step 2: Simulating Movie Data Fetch via LLM]");
+        const { refinedTitle } = inputObject;
+
+        if (!refinedTitle || refinedTitle.startsWith("UNCERTAIN:")) {
+            const message = `OMDB LLM Simulator: Cannot reliably simulate for title: ${refinedTitle}`;
+            console.warn(`  ${message}`);
+            return {
+                ...inputObject,
+                movieDataFromOMDB: {
+                    error: message,
+                    title: refinedTitle.replace("UNCERTAIN: ", ""),
+                    plotSummary: "N/A", genre:"N/A", year:"N/A", imdbRating:"N/A", mainCast:"N/A", Response: "False"
+                }
             };
         }
-        if (movieDataFromOMDB.error) {
-            console.warn(`  OMDB Fetch problem for "${inputObject.refinedTitle}": ${movieDataFromOMDB.error}`);
-        } else {
-            console.log(`  Successfully fetched/parsed data for: "${movieDataFromOMDB.title} (${movieDataFromOMDB.year})"`);
+
+        try {
+            const rawSimulatedJsonString = await omdbSimulationLlmChain.invoke({ refined_movie_title: refinedTitle });
+            console.log(`  LLM Raw Simulated OMDB Response String: ${rawSimulatedJsonString}`);
+            
+            const cleanedJsonString = extractJsonFromString(rawSimulatedJsonString); // MODIFIED
+            let data;
+            try {
+                data = JSON.parse(cleanedJsonString); // MODIFIED
+            } catch (parseError) {
+                console.error(`  Error parsing LLM's cleaned simulated JSON for "${refinedTitle}": ${parseError.message}. Cleaned: ${cleanedJsonString}. Raw: ${rawSimulatedJsonString}`);
+                throw new Error(`Failed to parse LLM's simulated OMDB JSON. Cleaned content: ${cleanedJsonString}`);
+            }
+
+            if (data.Response === 'False') {
+                const errorMsg = data.Error || "LLM indicated movie not found or error.";
+                console.warn(`  LLM Simulated OMDB Error for title "${refinedTitle}": ${errorMsg}`);
+                return {
+                    ...inputObject,
+                    movieDataFromOMDB: {
+                        error: `LLM Sim: ${errorMsg}`,
+                        title: data.Title || refinedTitle,
+                        plotSummary: "N/A", genre:"N/A", year:"N/A", imdbRating:"N/A", mainCast:"N/A", Response: "False"
+                    }
+                };
+            }
+            const result = {
+                title: data.Title || refinedTitle,
+                year: data.Year || 'N/A',
+                imdbRating: data.imdbRating || 'N/A',
+                mainCast: (data.Actors ? String(data.Actors).split(',').map(actor => actor.trim()).slice(0,5).join(', ') : 'N/A') || 'N/A',
+                genre: data.Genre || 'N/A',
+                plotSummary: data.Plot || 'N/A',
+                Response: "True"
+            };
+            console.log(`  [LLM OMDB Sim]: Successfully processed simulated data for: "${result.title} (${result.year || 'N/A'})"`);
+            return { ...inputObject, movieDataFromOMDB: result };
+
+        } catch (error) {
+            console.error(`  [LLM OMDB Sim]: Critical error simulating OMDB for "${refinedTitle}":`, error);
+            return {
+                ...inputObject,
+                movieDataFromOMDB: {
+                    error: `LLM OMDB Sim critical error for title "${refinedTitle}": ${error.message}`,
+                    title: refinedTitle,
+                    plotSummary: "N/A", genre:"N/A", year:"N/A", imdbRating:"N/A", mainCast:"N/A", Response: "False"
+                }
+            };
         }
-        return { ...inputObject, movieDataFromOMDB };
-    }).withConfig({ runName: "OMDBFetcherStep" });
+    }).withConfig({ runName: "OMDBLLMSimulatorStep" });
 
     const themeGeneratorRunnable = RunnableLambda.from(async (inputObject) => {
         console.log("\n[LCEL Step 3: Generating Movie Theme]");
         const { movieDataFromOMDB } = inputObject;
 
-        if (movieDataFromOMDB.error || !movieDataFromOMDB.plotSummary || movieDataFromOMDB.plotSummary === "N/A") {
-            console.warn(`  Skipping theme generation for "${movieDataFromOMDB.title}" due to missing/error in movie data.`);
-            return { ...inputObject, generatedTheme: "Theme could not be determined due to prior issues." };
+        if (movieDataFromOMDB.error || !movieDataFromOMDB.plotSummary || movieDataFromOMDB.plotSummary === "N/A" || movieDataFromOMDB.Response === "False") {
+            const reason = movieDataFromOMDB.error || "missing plot/data from OMDB sim";
+            console.warn(`  Skipping theme generation for "${movieDataFromOMDB.title || inputObject.refinedTitle}" due to: ${reason}.`);
+            return { ...inputObject, generatedTheme: "Theme could not be determined due to prior issues or lack of plot details." };
         }
 
-        const themeResult = await themeGenerationChain.invoke({
-            title: movieDataFromOMDB.title,
-            genre: movieDataFromOMDB.genre,
-            plot: movieDataFromOMDB.plotSummary,
-        });
-        const theme = themeResult.movie_theme_text.trim();
-        console.log(`  Generated Theme for "${movieDataFromOMDB.title}": "${theme}"`);
-        return { ...inputObject, generatedTheme: theme };
+        try {
+            const themeResult = await themeGenerationChain.invoke({
+                title: movieDataFromOMDB.title,
+                genre: movieDataFromOMDB.genre,
+                plot: movieDataFromOMDB.plotSummary,
+            });
+            const theme = themeResult.movie_theme_text ? themeResult.movie_theme_text.trim() : "Theme could not be determined.";
+            console.log(`  Generated Theme for "${movieDataFromOMDB.title}": "${theme}"`);
+            return { ...inputObject, generatedTheme: theme };
+        } catch (error) {
+            console.error(`  Error during theme generation for "${movieDataFromOMDB.title}": ${error.message}`);
+            return { ...inputObject, generatedTheme: "Theme generation failed due to an error." };
+        }
     }).withConfig({ runName: "ThemeGenerationStep" });
 
-    const fileWriterRunnable = RunnableLambda.from(async (inputObject) => {
-        console.log("\n[LCEL Step 4: Writing Details to File]");
-        const { movieDataFromOMDB, generatedTheme } = inputObject;
+    const fileWriterLLMRunnable = RunnableLambda.from(async (inputObject) => {
+        console.log("\n[LCEL Step 4: LLM Generating File Content/Name & Writing File]");
+        const { movieDataFromOMDB, generatedTheme, refinedTitle } = inputObject;
 
-        const finalMovieDataForFile = {
-            title: movieDataFromOMDB.title || inputObject.refinedTitle,
+        const detailsForFileLLM = {
+            title: movieDataFromOMDB.title || refinedTitle || "Unknown Movie",
             year: movieDataFromOMDB.year || 'N/A',
             imdbRating: movieDataFromOMDB.imdbRating || 'N/A',
             mainCast: movieDataFromOMDB.mainCast || 'N/A',
             genre: movieDataFromOMDB.genre || 'N/A',
             plotSummary: movieDataFromOMDB.plotSummary || 'N/A',
             movieTheme: generatedTheme || 'Theme could not be determined.',
-            omdbError: movieDataFromOMDB.error || null
         };
-         if (finalMovieDataForFile.omdbError && !finalMovieDataForFile.plotSummary === 'N/A') {
-            console.warn(`  File for "${finalMovieDataForFile.title}" will reflect data fetching issues.`);
+
+        if (movieDataFromOMDB.error && detailsForFileLLM.plotSummary === 'N/A') {
+            console.warn(`  File for "${detailsForFileLLM.title}" will reflect data fetching issues from OMDB sim: ${movieDataFromOMDB.error}`);
         }
 
-        const fileWriteResult = await fileWriterTool._call(JSON.stringify(finalMovieDataForFile));
-        console.log(`  File Writer Status: ${fileWriteResult}`);
-        return { finalMessage: fileWriteResult, writtenData: finalMovieDataForFile };
-    }).withConfig({ runName: "FileWriterStep" });
+        try {
+            const rawLlmJsonOutput = await fileContentGenerationLlmChain.invoke(detailsForFileLLM);
+            console.log(`  LLM Raw File Details JSON String: ${rawLlmJsonOutput}`);
+            
+            const cleanedLlmJsonOutput = extractJsonFromString(rawLlmJsonOutput); // MODIFIED
+            let fileDetails;
+            try {
+                fileDetails = JSON.parse(cleanedLlmJsonOutput); // MODIFIED
+                if (!fileDetails.filename || typeof fileDetails.filename !== 'string' || !fileDetails.file_content || typeof fileDetails.file_content !== 'string') {
+                    throw new Error("LLM response missing 'filename' or 'file_content', or they are not strings.");
+                }
+            } catch (parseError) {
+                console.error(`  Error parsing LLM's cleaned file details JSON for "${detailsForFileLLM.title}": ${parseError.message}. Cleaned: ${cleanedLlmJsonOutput}. Raw: ${rawLlmJsonOutput}`);
+                console.warn(`  Falling back to manual file naming for "${detailsForFileLLM.title}".`);
+                const fallbackFilename = sanitizeFilename(detailsForFileLLM.title) + ".txt";
+                const fallbackFileContent = `Movie Title: ${detailsForFileLLM.title} (${detailsForFileLLM.year})\n` +
+                                           `--------------------------------------\n` +
+                                           `Error: LLM failed to generate structured file content. Raw output was: ${rawLlmJsonOutput}\n` +
+                                           `OMDB Sim Error: ${movieDataFromOMDB.error || 'N/A'}\n` +
+                                           `Plot: ${detailsForFileLLM.plotSummary}\n` +
+                                           `Theme: ${detailsForFileLLM.movieTheme}`;
+                fileDetails = { filename: fallbackFilename, file_content: fallbackFileContent };
+            }
+
+            const finalFilename = sanitizeFilename(fileDetails.filename);
+            const filePath = path.join(OUTPUT_DIR, finalFilename);
+
+            await fs.mkdir(OUTPUT_DIR, { recursive: true });
+            await fs.writeFile(filePath, fileDetails.file_content);
+
+            const successMessage = `Successfully wrote movie details for "${detailsForFileLLM.title}" to: ${filePath} (content/name by LLM, fallback: ${fileDetails.filename === sanitizeFilename(detailsForFileLLM.title) + ".txt" && fileDetails.file_content.includes("LLM failed to generate")})`;
+            console.log(`  [FileWriterLLM]: ${successMessage}`);
+            return { finalMessage: successMessage, writtenData: { ...detailsForFileLLM, filename: finalFilename } };
+
+        } catch (error) {
+            const errorMsg = `[FileWriterLLM]: Error during LLM file generation or writing for "${detailsForFileLLM.title}": ${error.message}`;
+            console.error(`  ${errorMsg}`);
+            return {
+                finalMessage: errorMsg,
+                writtenData: { ...detailsForFileLLM, filename: sanitizeFilename(detailsForFileLLM.title) + "_error.txt" }
+            };
+        }
+    }).withConfig({ runName: "LLMFileWriterStep" });
+
 
     const fullSequence = RunnableSequence.from([
         titleRefinerRunnable,
-        omdbFetcherRunnable,
+        omdbSimulatorRunnable,
         themeGeneratorRunnable,
-        fileWriterRunnable,
+        fileWriterLLMRunnable,
     ]);
 
     try {
         const result = await fullSequence.invoke({ raw_title: rawUserMovieTitle });
         console.log("\n LCEL Sequence completed.");
-        console.log("Final Output from Sequence:", result.finalMessage);
+        if (result && result.finalMessage) {
+            console.log(" Final Output from Sequence:", result.finalMessage);
+        } else {
+            console.log(" Sequence finished, but no final message was explicitly returned by the last step. Check logs for file path.");
+        }
     } catch (error) {
         console.error("\n Critical error during LCEL sequence execution:", error);
+        if (error.message && error.input) {
+            console.error("  Error details:", { message: error.message, input: error.input, step: error.runName });
+        }
     }
 }
 
 (async () => {
-    const movieNameInput = process.argv.slice(2).join(" ") || "inceptio";
+    const movieNameInput = process.argv.slice(2).join(" ") || "Inception";
     await processMovieWithLCELSequence(movieNameInput);
 })();

@@ -1,16 +1,16 @@
 Movie Title: Uri: The Surgical Strike (2019)
 --------------------------------------
 IMDb Rating:
-  8.2
+  8.4
 
 Main Cast:
-  Vicky Kaushal, Paresh Rawal, Mohit Raina
+  Vicky Kaushal, Paresh Rawal, Mohit Raina, Yami Gautam
 
 Genre(s):
-  Action, Drama, History
+  Action, Drama, War
 
 Movie Theme:
-  Nationalistic heroism and the devastating consequences of cross-border terrorism.
+  Justice, retribution, and the consequences of cross-border terrorism.
 
 Plot Summary:
-  Divided over five chapters, the film chronicles the events of the surgical strike conducted by the Indian military against suspected militants in Pakistan occupied Kashmir. It tells the story of the 11 tumultuous events over which the operation was carried out. Indian army special forces carry out a covert operation to avenge the killing of fellow army men at their base by a terrorist group.
+  A covert operation is launched by the Indian Army after the killing of Indian soldiers in the Uri attack.
