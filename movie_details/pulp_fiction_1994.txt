@@ -1,0 +1,16 @@
+Movie Title: Pulp Fiction (1994)
+--------------------------------------
+IMDb Rating:
+  8.9
+
+Main Cast:
+  John Travolta, Samuel L. Jackson, Uma Thurman, Bruce Willis, Christopher Walken
+
+Genre(s):
+  Crime, Drama
+
+Movie Theme:
+  Intertwined tales of violence, redemption, and the unexpected connections between seemingly disparate lives in the criminal underworld.
+
+Plot Summary:
+  The lives of two mob hitmen, a boxer, a gangster's wife, and a pair of diner bandits intertwine in four tales of violence and redemption.
